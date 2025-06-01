@@ -1,0 +1,341 @@
+---
+title: "Soil_carbon_predictiion"
+output: 
+date: "2025-04-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load libraries
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(randomForest) 
+library(caTools)
+library(caret)
+library(ggpmisc)
+```
+The data used here includes:-
+
+The daily soil CO2 flux data observed from LICOR's Automated Soil CO₂ Flux System
+
+The variables soil water content (SWC), soil temperature (T_soil), atmospheric temperature (T_air), relative humidity (RH), incoming long-wave (RAD_lw) and short-wave radiation (RAD_sw), and soil heat flux (SHF) and the difference between atmospheric and soil temperatures (T_diff)
+
+Hourly data from 2015 to 2016 were used for training and testing the models. Variables from 2018 for prediction
+
+```{r}
+#Data
+
+df_predict<- read.csv("D:/dattebayo/flux/soil_github/soil_github/test_data.csv")
+df_train<- read.csv("D:/dattebayo/flux/soil_github/soil_github/training.csv")
+
+
+# Ensure dates are in proper format
+df_train$date<-as.POSIXct(df_train$date, "%d-%m-%Y %H:%M", tz="")
+head(df_train)
+```
+```{r}
+# Ensure dates are in proper format
+df_predict$date<-as.POSIXct(df_predict$date, "%d-%m-%Y %H:%M", tz="")
+head(df_predict)
+```
+
+```{r}
+# Splitting data for training and testing of models
+set.seed(25) # for reproducibility
+split <- sample.split(df_train, SplitRatio = 0.7) 
+train <- subset(df_train, split == "TRUE") 
+test <- subset(df_train, split == "FALSE") 
+```
+
+
+## Q10 Model
+
+Temperature sensitivity, Q10, model is commonly used to estimate soil carbon flux based on the observed temperature dependency on biological activity.
+
+Rs= 𝛼exp(β T_soil)
+
+where Rs is the soil respiration
+
+```{r}
+
+# Calculate logarithmic values of soil respiration
+train$log_respiration <- log(train$co2_flux)
+train<-filter(train, !is.na(train$log_respiration)) # removing NAs
+
+
+# Wet Data
+wet_data<- train %>% filter(SWC > 0.5)
+
+# Fitting the model
+fit_wet <- lm(log_respiration ~ T_soil, data = wet_data)
+
+# Model summary
+summary(fit_wet)
+
+# Extract the slope of the regression line
+al_wet <- coef(fit_wet)[1]
+alpha_wet<- exp(al_wet)
+beta_wet <-coef(fit_wet)[2]
+
+cat("Parameter alpha for wet state is ", alpha_wet, "\n")
+cat("Parameter beta for wet state is ", beta_wet, "\n")
+
+```
+```{r}
+# Dry data
+dry_data<- train %>% filter(SWC <= 0.5)
+
+#Fitting the model
+fit_dry <- lm(log_respiration ~ T_soil, data = dry_data)
+
+# Model summary
+summary(fit_dry)
+
+# Extract the slope of the regression line
+al_dry <- coef(fit_dry)[1]
+alpha_dry<- exp(al_dry)
+beta_dry <-coef(fit_dry)[2]
+
+cat("Parameter alpha for dry state is ", alpha_dry, "\n")
+cat("Parameter beta for dry state is ", beta_dry, "\n")
+
+```
+
+
+Parameters of Q10 model calculated for Betul region
+𝛼wet 0.196
+βwet 0.080
+𝛼dry 2.156
+βdry -0.003
+
+
+```{r}
+
+# Calculate soil respiration using Q10 model on test sample
+q10_model<- test %>% mutate(respiration = case_when(SWC > 0.5 ~ alpha_wet * exp(beta_wet * T_soil),
+                                                        SWC <= 0.5 ~ alpha_dry * exp(beta_dry * T_soil),
+                                                        TRUE ~ NA))
+
+postResample(pred = q10_model$respiration, obs = q10_model$co2_flux) 
+```
+```{r}
+# Plot regression line
+ggplot(q10_model,aes(x=co2_flux,y=respiration))+
+  geom_point(color="#19285f")+ 
+  theme_bw()+xlab("Observed value")+ylab("Predicted value")+  
+  stat_poly_line(formula = y ~ x, method = "lm", se = FALSE, color = "black")+
+  stat_poly_eq()+
+  theme(axis.text=element_text(size=20), axis.title=element_text(size=22,face="bold"))
+
+
+```
+
+```{r}
+
+# Predict soil respiration for 2018 
+q10<- df_predict %>% mutate(respiration = case_when(SWC > 0.5 ~ alpha_wet * exp(beta_wet * T_soil),
+                                                        SWC <= 0.5 ~ alpha_dry * exp(beta_dry * T_soil),
+                                                        TRUE ~ NA)) %>%
+  group_by(Date= date(date)) %>%   
+  summarise(respiration=mean(respiration)*12.01*60*60*24/1000000 )
+
+
+# Plot the predicted values
+
+ggplot(q10, aes(x = as.Date(Date), group = cumsum(c(0, diff(Date) > 1)))) +
+  geom_path(aes(y = respiration)) +
+  scale_x_date(name = "Date", breaks = "1 month", date_labels = "%b") +
+  ylab(expression("Soil Carbon Flux (gC m"^-2*".day"^-1*")")) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18, face = "bold")) +
+  ylim(c(0,5))
+```
+
+## MODIFIED Q10
+
+Takes into consideration soil moisture as well soil temperature
+
+ Rs= β0.e(β1.T_soil).e(β2.SWC +β3.SWC^2)
+
+```{r}
+# Model
+mq10_model <- lm(log_respiration ~ T_soil + SWC + I(SWC^2), data = train)
+
+summary(mq10_model)
+# Extract coefficients
+beta_0_prime <- coef(mq10_model)[1]  # ln(beta_0)
+beta_1 <- coef(mq10_model)[2]    # beta_1
+beta_2 <- coef(mq10_model)[3]    # beta_2
+beta_3 <- coef(mq10_model)[4]    # beta_3
+beta_0 <- exp(beta_0_prime)      # beta_0
+
+cat("Parameter beta 0 is ", beta_0, "\n")
+cat("Parameter beta 1 is ", beta_1, "\n")
+cat("Parameter beta 2 is ", beta_2, "\n")
+cat("Parameter beta 3 is ", beta_3, "\n")
+
+```
+
+
+
+The parameters for modified Q10 model
+β0 0.00025
+β1 -0.005
+β2 33.92
+β3 -29.887
+
+
+```{r}
+# Test modified Q10
+modified_q10<-test %>% mutate(respiration = beta_0 * exp(beta_1 * T_soil) * exp(beta_2 * SWC) * exp(beta_3 * (SWC^2)))
+
+postResample(pred = modified_q10$respiration, obs = modified_q10$co2_flux) 
+
+```
+
+```{r}
+# Scatterplot with regression line
+ggplot(modified_q10,aes(x=co2_flux,y=respiration))+
+  geom_point(color="#19285f")+ 
+  theme_bw()+xlab("Observed value")+ylab("Predicted value")+  
+  stat_poly_line(formula = y ~ x, method = "lm", se = FALSE, color = "black")+
+  stat_poly_eq()+
+  theme(axis.text=element_text(size=20), axis.title=element_text(size=22,face="bold"))
+```
+
+```{r}
+
+# Predict soil repiration using modified Q10
+mod_q10<- df_predict %>% mutate(respiration = beta_0 * exp(beta_1 * T_soil) * exp(beta_2 * SWC) * exp(beta_3 * (SWC^2))) %>% 
+  group_by(Date= date(date)) %>%   summarise(respiration= mean(respiration)*12.01*60*60*24/1000000 )
+
+# Plotting data
+ggplot(mod_q10, aes(x = as.Date(Date), group = cumsum(c(0, diff(Date) > 1)))) +
+  geom_path(aes(y = respiration)) +
+  scale_x_date(name = "Date", breaks = "1 month", date_labels = "%b") +
+  ylab(expression("Soil Carbon Flux (gC m"^-2*".day"^-1*")")) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18, face = "bold"))+
+  ylim(c(0,5))
+```
+
+
+## RF2
+
+Random forest model using T_soil and SWC as variables
+
+```{r}
+set.seed(394)
+# Ten fold cross validation
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+set.seed(24) # for reproducibility
+
+# Training data
+rf2_model <-caret::train(x = train[,c(3,4)], 
+                        y = train[,2], trControl=train_control, method="rf")
+
+print(rf2_model)
+
+```
+```{r}
+# Test the data
+rf2_p <- predict(rf2_model, newdata = test[,c(3,4)]) 
+rf2_o<- test[,2]
+
+postResample(pred = rf2_p, obs = rf2_o) 
+
+```
+```{r}
+# Plot regression line
+ggplot(data.frame(obs=rf2_o, pred=rf2_p),aes(x=obs,y=pred))+
+  geom_point(color="#19285f")+ 
+  theme_bw()+xlab("Observed value")+ylab("Predicted value")+  
+  stat_poly_line(formula = y ~ x, method = "lm", se = FALSE, color = "black")+
+  stat_poly_eq()+
+  theme(axis.text=element_text(size=20), axis.title=element_text(size=22,face="bold"))
+```
+
+```{r}
+# Prediction 
+
+rf2_pred <- predict(rf2_model, newdata = df_predict[,c(2,3)]) 
+rf2_predicted<- cbind(df_predict, rf2_pred)
+
+rf2_predict <- rf2_predicted %>% group_by(Date= date(date)) %>%   summarise( rf2_pred= mean(rf2_pred)*12.01*60*60*24/1000000 )
+
+# Plot predicted values
+
+ggplot(rf2_predict, aes(x = as.Date(Date), group = cumsum(c(0, diff(Date) > 1)))) +
+  geom_path(aes(y = rf2_pred)) +
+  scale_x_date(name = "Date", breaks = "1 month", date_labels = "%b") +
+  ylab(expression("Soil Carbon Flux (gC m"^-2*".day"^-1*")")) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18, face = "bold"))+
+  ylim(c(0,5))
+
+```
+
+
+## RF8
+
+Random forest model using all the variables mentioned in the data
+
+```{r}
+# Training data
+
+set.seed(245) # for reproducibility
+rf8_model <-caret::train(x = train[,-c(1,2,11)], 
+                        y = train[,2], trControl=train_control, method="rf")
+
+print(rf8_model)
+```
+
+```{r}
+# Test the data
+rf8_p <- predict(rf8_model, newdata = test[,-c(1,2,11)]) 
+rf8_o<- test[,2]
+
+postResample(pred = rf8_p, obs = rf8_o) 
+```
+
+```{r}
+# Plot regression line
+ggplot(data.frame(obs=rf8_o, pred=rf8_p),aes(x=obs,y=pred))+
+  geom_point(color="#19285f")+ 
+  theme_bw()+xlab("Observed value")+ylab("Predicted value")+  
+  stat_poly_line(formula = y ~ x, method = "lm", se = FALSE, color = "black")+
+  stat_poly_eq()+
+  theme(axis.text=element_text(size=20), axis.title=element_text(size=22,face="bold"))
+```
+
+```{r}
+# Prediction for 2018
+rf8_pred <- predict(rf8_model, newdata = df_predict[,-c(1)]) 
+rf8_predicted<- cbind(df_predict, rf8_pred)
+
+rf8_predict <- rf8_predicted %>% group_by(Date= date(date)) %>% summarise( rf8_pred= mean(rf8_pred)*12.01*60*60*24/1000000 )
+
+#Plot predicted data
+
+ggplot(rf8_predict, aes(x = as.Date(Date), group = cumsum(c(0, diff(Date) > 1)))) +
+  geom_path(aes(y = rf8_pred)) +
+  scale_x_date(name = "Date", breaks = "1 month", date_labels = "%b") +
+  ylab(expression("Soil Carbon Flux (gC m"^-2*".day"^-1*")")) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 16),
+        axis.title = element_text(size = 18, face = "bold")) +
+  ylim(0,5)
+
+```
+
+
+```{r}
+plot(varImp(rf8_model, main = "Variable Importance - Random Forest"))
+```
